@@ -45,18 +45,6 @@ function withSecurityHeaders(response: Response): Response {
 // Marketing pages get the locale middleware and the right <html lang>. The
 // app, docs, and API never go through it.
 export const handle: Handle = async ({ event, resolve }) => {
-	// Keep this preview and its paid server-side credentials private.
-	if (!building && env.PREVIEW_TOKEN && !/^\/api\/stt\/audio\/[a-f0-9]{48}$/.test(event.url.pathname)) {
-		const token = event.url.searchParams.get('access');
-		if (token === env.PREVIEW_TOKEN) {
-			event.cookies.set('utsuwa_preview', token, { path: '/', httpOnly: true, sameSite: 'lax', secure: event.url.protocol === 'https:', maxAge: 604800 });
-			event.url.searchParams.delete('access');
-			return new Response(null, { status: 303, headers: { Location: event.url.pathname + event.url.search, 'Set-Cookie': event.cookies.serialize('utsuwa_preview', token, { path: '/', httpOnly: true, sameSite: 'lax', secure: event.url.protocol === 'https:', maxAge: 604800 }) } });
-		}
-		if (event.cookies.get('utsuwa_preview') !== env.PREVIEW_TOKEN) {
-			return new Response('请使用提供给你的专属预览链接打开网站。', { status: 401, headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
-		}
-	}
 	const isPublicAuth = event.url.pathname.startsWith('/api/auth/') || event.url.pathname === '/api/preview';
 	const signedAudio = /^\/api\/stt\/audio\/[a-f0-9]{48}$/.test(event.url.pathname);
 	if (!building && event.url.pathname.startsWith('/api/') && !isPublicAuth && !signedAudio) {

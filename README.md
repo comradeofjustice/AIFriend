@@ -65,7 +65,6 @@ pnpm dev --host localhost
 | `VOLC_TTS_API_KEY` | 语音合成 Key |
 | `VOLC_TTS_RESOURCE_ID`、`VOLC_TTS_VOICE_ID` | 合成资源与音色 |
 | `VOLC_ASR_API_KEY`、`VOLC_ASR_RESOURCE_ID` | 识别 Key 与已开通的资源 |
-| `PREVIEW_TOKEN` | 可选的私人体验入口口令，留空则不启用额外入口限制 |
 | `HOST`、`PORT`、`ORIGIN` | 生产监听地址、端口及对外访问地址 |
 | `BODY_SIZE_LIMIT` | 上传请求大小限制 |
 | `ADDRESS_HEADER`、`XFF_DEPTH` | 可信反向代理下的客户端 IP 配置 |
@@ -76,7 +75,8 @@ pnpm dev --host localhost
 - SMTP 465 端口通常使用 `SMTP_SECURE=true`；587 使用 `false` 并通过 STARTTLS 加密。
 - 只有通过可信反向代理访问服务时，才设置转发 IP 相关变量。
 - 密钥不得使用 `PUBLIC_` 或 `VITE_` 前缀，也不要写入前端代码。
-- 若设置了 `PREVIEW_TOKEN`，使用自己的 `/api/preview?access=YOUR_PREVIEW_TOKEN` 入口进入，不在公开文档中放真实口令。
+
+网站可直接访问 `/login` 注册或登录，无需额外的预览口令。账号验证和用户数据隔离仍然保留。
 
 ## 生产部署
 
