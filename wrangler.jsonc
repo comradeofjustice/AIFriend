@@ -1,0 +1,32 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "utsuwa",
+	// adapter-cloudflare writes SvelteKit's worker here. Deploys use
+	// cloudflare-worker.js instead (see the cf:deploy scripts), which does the
+	// host routing and then hands off to this one.
+	"main": ".svelte-kit/cloudflare/_worker.js",
+	"compatibility_date": "2026-09-26",
+	"compatibility_flags": ["nodejs_compat"],
+	"assets": {
+		"binding": "ASSETS",
+		"directory": ".svelte-kit/cloudflare",
+		// "/" is prerendered, but docs. and app. each have their own root.
+		"run_worker_first": ["/"]
+	},
+	// Production domains. The apex isn't here: a Cloudflare redirect rule sends
+	// it to www. Forks deploying elsewhere: swap in your own or drop this block.
+	"routes": [
+		{ "pattern": "www.utsuwa.ai", "custom_domain": true },
+		{ "pattern": "app.utsuwa.ai", "custom_domain": true },
+		{ "pattern": "docs.utsuwa.ai", "custom_domain": true }
+	],
+	// No public workers.dev copy of the site; version previews stay on.
+	"workers_dev": false,
+	"preview_urls": true,
+	// Per-IP cap on /api/* (cloudflare-worker.js). A long reply with Fish Audio is
+	// about 20 calls, so this only stops floods. Counts are per Cloudflare location.
+	"ratelimits": [
+		{ "name": "API_RATE_LIMIT", "namespace_id": "1001", "simple": { "limit": 240, "period": 60 } }
+	],
+	"observability": { "enabled": true }
+}

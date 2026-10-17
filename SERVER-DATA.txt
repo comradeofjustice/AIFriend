@@ -1,0 +1,10 @@
+当前部署使用服务器 SQLite 数据库：/var/lib/utsuwa-auth/utsuwa.sqlite。
+账号、邮箱验证码摘要、登录会话摘要、聊天、记忆、人物、提醒、设置和上传素材均在此数据库。
+密码使用随机盐和 scrypt 哈希；原始密码及验证码不入库。
+数据库目录由 AUTH_DATA_DIR 环境变量指定，位于项目之外，升级项目不会覆盖。
+浏览器只保存 HttpOnly 登录 Cookie；运行时数据仅在内存，不写 localStorage 或 IndexedDB。
+只有旧存档迁移模块会读取旧浏览器存档，提交成功后再清理对应账号的旧数据。
+旧浏览器账号需要先使用同一邮箱完成验证码注册。迁移失败可在“设置 → 数据”重试。
+API 根据服务端会话分配账号；X-Utsuwa-Account 仅用于检测旧标签页，不能作为身份凭证。
+备份数据库必须使用 SQLite backup API 或停止服务后完整备份，不能单独复制正在写入的主文件而漏掉 WAL。
+部署前备份位于 /var/backups/utsuwa/；需要恢复时同时核对 .env 的 AUTH_SECRET 和数据库版本。

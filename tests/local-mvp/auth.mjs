@@ -1,0 +1,36 @@
+import assert from 'node:assert/strict';
+import { mkdtemp,readFile,rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { randomBytes } from 'node:crypto';
+import { openDatabase } from '../../src/lib/server/database/sqlite.ts';
+import { AuthService } from '../../src/lib/server/auth/core.ts';
+const directory=await mkdtemp(join(tmpdir(),'utsuwa-auth-test-'));
+let now=Date.now(),mails=[];
+const secret=randomBytes(32).toString('hex');
+const options={directory,secret,now:()=>now,deliver:async(email,code)=>{mails.push({email,code});}};
+const auth=new AuthService(options);
+try{
+ await assert.rejects(auth.register('owner@example.test','example-password','000000','test-ip'));
+ await auth.sendCode(' OWNER@example.test ','test-ip');assert.equal(mails[0].email,'owner@example.test');
+ await assert.rejects(auth.sendCode('owner@example.test','test-ip'),e=>e.status===429);
+ const wrong=mails[0].code==='000000'?'111111':'000000';
+ await assert.rejects(auth.register('owner@example.test','example-password',wrong,'test-ip'));
+ const pastedCode=' '+mails[0].code.split('').map(d=>String.fromCharCode(d.charCodeAt(0)+0xfee0)).join(' \u200b')+' ';
+ const registered=await auth.register('owner@example.test','example-password',pastedCode,'test-ip');
+ assert.equal((await auth.identity(registered.token)).email,'owner@example.test');
+ await assert.rejects(auth.register('owner@example.test','example-password',mails[0].code,'test-ip'));
+ await assert.rejects(auth.login('owner@example.test','wrong-password','test-ip'));
+ const logged=await auth.login('OWNER@example.test','example-password','test-ip');assert.equal(logged.user.id,registered.user.id);
+ const restarted=new AuthService(options);assert.equal((await restarted.identity(logged.token)).id,registered.user.id);
+ await restarted.logout(logged.token);assert.equal(await restarted.identity(logged.token),null);
+ now+=61000;await auth.sendCode('expire@example.test','other-ip');const expired=mails.at(-1).code;now+=600001;
+ await assert.rejects(auth.register('expire@example.test','example-password',expired,'other-ip'));
+ await auth.sendCode('attempts@example.test','third-ip');const actual=mails.at(-1).code;
+ for(let i=0;i<5;i++)await assert.rejects(auth.register('attempts@example.test','example-password',actual==='000000'?'111111':'000000','third-ip'));
+ await assert.rejects(auth.register('attempts@example.test','example-password',actual,'third-ip'),e=>e.status===429);
+ const sqlite=openDatabase(join(directory,'utsuwa.sqlite'));
+ const content=JSON.stringify(sqlite.prepare('SELECT * FROM auth_users').all());assert.ok(!content.includes('example-password'));assert.ok(!content.includes(registered.token));
+ assert.equal(sqlite.prepare('SELECT id FROM auth_codes WHERE id=?').get('owner@example.test'),undefined);
+ console.log('PASS: email-code requirement, expiry, retry limit, single use, password verification, session persistence/revocation, and private hash storage.');
+}finally{openDatabase(join(directory,'utsuwa.sqlite')).close();await rm(directory,{recursive:true,force:true});}

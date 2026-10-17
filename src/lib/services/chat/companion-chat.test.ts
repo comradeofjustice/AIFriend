@@ -1,0 +1,1105 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { fileURLToPath } from 'node:url';
+import { createServer } from 'vite';
+import { createDefaultCharacterState } from '../../engine/character-defaults.ts';
+import { parseResponse } from '../../ai/response-parser.ts';
+import { StreamingSpeechBuffer } from '../tts/streaming-speech-buffer.ts';
+import type { SpeechSegment } from '../voice-orchestrator.ts';
+
+// Run the actual companion and transport modules. Only browser stores and
+// persistence are replaced; the prompt, parsers, buffer and hosted xsai stream
+// stay real so this test covers their event ordering together.
+test('companion chat preserves native speech across direct and hosted state blocks', async (t) => {
+	const root = fileURLToPath(new URL('../../../../', import.meta.url)).replace(/\/$/, '');
+	const speech = { activeProvider: 'omnivoice', activeLanguage: 'en', altLanguage: 'es', enableAltLanguage: true, enableToolCalling: true };
+	let direct = true;
+	let llmProvider = 'openai-compatible';
+	let contextSize: number | undefined;
+	let buffer: StreamingSpeechBuffer | undefined;
+	let spoken: SpeechSegment[] = [];
+	const turns: ReturnType<typeof parseResponse>[] = [];
+	let latest = '';
+	const thinking: boolean[] = [];
+	let speechEnabled = true;
+	let visionEnabled = false;
+	const visionSettings: { activeProvider: string; activeModel?: string } = { activeProvider: 'openai-compatible', activeModel: 'vision-model' };
+	let speechStarted = false;
+	const hints: string[] = [];
+	const said: string[] = [];
+	let cancels = 0;
+	const messages: { id: string; role: string; content: string }[] = [];
+	const chatStore = {
+		messages, isLoading: false, error: null as string | null,
+		addMessage: (role: string, content: string) => {
+			const message = { id: crypto.randomUUID(), role, content };
+			messages.push(message);
+			return message;
+		},
+		removeMessage: (id: string) => {
+			const index = messages.findIndex((m) => m.id === id);
+			if (index >= 0) messages.splice(index, 1);
+		},
+		updateLastMessage: (content: string) => { messages[messages.length - 1].content = content; },
+		setLoading: (value: boolean) => { chatStore.isLoading = value; },
+		setError: (value: string | null) => { chatStore.error = value; }
+	};
+	const fixtures = {
+		chatStore,
+		characterStore: { state: createDefaultCharacterState(), isReady: false },
+		personaStore: { activeCard: { id: 'test', name: 'Utsuwa', systemPrompt: 'Friendly', extensions: {} } },
+		settingsStore: { getProviderConfig: () => ({ apiKey: 'test-key', baseUrl: 'https://provider.invalid/v1/' }) },
+		modulesStore: {
+			isModuleEnabled: (id: string) => id !== 'vision' || visionEnabled,
+			getModuleState: () => ({ enabled: speechEnabled }),
+			getModuleSettings: (id: string) =>
+				id === 'speech' ? speech : id === 'vision' ? visionSettings : { activeProvider: llmProvider, activeModel: 'test-model', contextSize }
+		},
+		vrmStore: { startTalking: () => {}, setThinking: (value: boolean) => { thinking.push(value); } },
+		animationLibraryStore: { enabledForLlm: [] },
+		reminderStore: { upcoming: [] },
+		ttsStore: {
+			beginStreaming: async () => {
+				speechStarted = true;
+				buffer = new StreamingSpeechBuffer({ defaultLanguage: 'en', onSegment: (s) => spoken.push(s) });
+				return true;
+			},
+			feedStreaming: (chunk: string) => buffer?.feed(chunk),
+			endStreaming: async () => { buffer?.flush(); },
+			cancelStreaming: () => { cancels++; buffer?.reset(); },
+			speak: (text: string) => { said.push(text); }
+		},
+		chatHintStore: { showHint: (hint: string) => { hints.push(hint); } },
+		chatDraftStore: {
+			draft: '',
+			pending: [] as unknown[],
+			addPending: (image: unknown, url: string) => { fixtures.chatDraftStore.pending.push({ image, url }); }
+		},
+		keepImage: async () => {},
+		mcpStore: {
+			ensureTools: async () => {},
+			hasActiveTools: false,
+			tools: [],
+			servers: [],
+			confirmations: [] as Array<{ serverName: string; toolName: string; args: Record<string, unknown> }>,
+			confirmAnswer: true,
+			async confirmToolCall(request: { serverName: string; toolName: string; args: Record<string, unknown> }) {
+				fixtures.mcpStore.confirmations.push(request);
+				return fixtures.mcpStore.confirmAnswer;
+			}
+		},
+		publicEnv: {} as Record<string, string>,
+		privateEnv: {} as Record<string, string>,
+		isTauri: () => direct,
+		processCompanionTurn: async ({ companionResponse }: { companionResponse: string }) => {
+			const parsed = parseResponse(companionResponse);
+			turns.push(parsed);
+			return { dialogue: parsed.dialogue, newMemory: parsed.stateUpdates?.newMemory, triggeredEvent: null };
+		}
+	};
+	const globals = globalThis as unknown as Record<string, unknown>;
+	globals.__utsuwaChatIntegration = fixtures;
+	const replacements: Record<string, string> = {
+		'$env/dynamic/private': 'export const env = globalThis.__utsuwaChatIntegration.privateEnv;',
+		'$env/dynamic/public': 'export const env = globalThis.__utsuwaChatIntegration.publicEnv;',
+		'src/lib/engine/memory': 'export const retrieveRelevantContext = async () => ({ recentTurns: [], relevantFacts: [], triggeredMemories: [], recentSessions: [] });',
+		'src/lib/engine/memory-session': 'export const getWorkingMemory = () => ({}); export const ensureSession = async () => null;',
+		'src/lib/services/storage/keepsakes': 'export const keepImage = (...args) => globalThis.__utsuwaChatIntegration.keepImage(...args);',
+		'src/lib/services/platform': 'export const isTauri = () => globalThis.__utsuwaChatIntegration.isTauri();',
+		'src/lib/services/chat/companion-turn': 'export const processCompanionTurn = (...args) => globalThis.__utsuwaChatIntegration.processCompanionTurn(...args);',
+		// The chat route's SSRF guard resolves the provider host; keep it offline.
+		'node:dns/promises': "export const lookup = async () => [{ address: '203.0.113.10', family: 4 }];"
+	};
+	for (const [path, name] of Object.entries({
+		chat: 'chatStore', character: 'characterStore', persona: 'personaStore', settings: 'settingsStore',
+		modules: 'modulesStore', vrm: 'vrmStore', 'animation-library': 'animationLibraryStore', reminders: 'reminderStore', tts: 'ttsStore', mcp: 'mcpStore', 'chat-hint': 'chatHintStore', 'chat-draft': 'chatDraftStore'
+	})) replacements[`src/lib/stores/${path}.svelte`] = `export const ${name} = globalThis.__utsuwaChatIntegration.${name};`;
+	const server = await createServer({
+		root, configFile: false, server: { middlewareMode: true }, appType: 'custom',
+		resolve: { alias: [
+			...Object.keys(replacements).map((key) => ({
+				find: key.replace('src/lib/', '$lib/'), replacement: '\0companion-test:' + key
+			})),
+			{ find: '$lib', replacement: `${root}/src/lib` }
+		] },
+		optimizeDeps: { noDiscovery: true, entries: [] },
+		plugins: [{
+			name: 'companion-test-stores',
+			resolveId(id) {
+				if (id.startsWith('\0companion-test:')) return id;
+				const key = id.startsWith(`${root}/`) ? id.slice(root.length + 1).replace(/\.ts$/, '') : id;
+				if (key in replacements) return '\0companion-test:' + key;
+			},
+			load(id) { if (id.startsWith('\0companion-test:')) return replacements[id.slice('\0companion-test:'.length)]; }
+		}]
+	});
+	try {
+		const { sendCompanionMessage, cancelActiveTurn } = await server.ssrLoadModule('/src/lib/services/chat/companion-chat.ts');
+		const { streamChat } = await server.ssrLoadModule('/src/lib/services/llm/transport.ts');
+		const { POST } = await server.ssrLoadModule('/src/routes/api/chat/+server.ts');
+		const state = '\n```json\n{"mood_change":{"emotion":"happy","intensity_delta":2},"new_memory":"They are learning Spanish"}\n```\nDuplicate text must stay hidden.';
+		const hooks = { setTyping: () => {}, setLatestResponse: (text: string) => { latest = text; }, setActiveEvent: () => {} };
+		for (const transport of ['direct', 'hosted']) {
+			for (const stateFirst of [true, false]) {
+				await t.test(`${transport}, state ${stateFirst ? 'before' : 'after'} native calls`, async (t) => {
+					direct = transport === 'direct';
+					messages.length = 0; spoken = []; turns.length = 0; thinking.length = 0;
+					const textEvents = [...state].map((content) => ({ choices: [{ delta: { content } }] }));
+					const toolEvents = ['Let me know how your interview goes.', 'Hola, buenos días.'].flatMap((text, index) => {
+						const args = JSON.stringify({ text, language: index ? 'es' : 'en' });
+						return [
+							{ choices: [{ delta: { tool_calls: [{ index, id: `call_${index}`, type: 'function', function: { name: 'speak_segment', arguments: args.slice(0, 10) } }] } }] },
+							{ choices: [{ delta: { tool_calls: [{ index, function: { arguments: args.slice(10) } }] } }] }
+						];
+					});
+					const events = stateFirst ? [...textEvents, ...toolEvents] : [...toolEvents, ...textEvents];
+					const wire = events.map((e) => `data: ${JSON.stringify(e)}\n\n`).join('') + 'data: [DONE]\n\n';
+					t.mock.method(globalThis, 'fetch', async (url: string, init: RequestInit) => {
+						if (url === '/api/chat') return POST({ request: new Request('http://localhost/api/chat', init) });
+						assert.equal(String(url), 'https://provider.invalid/v1/chat/completions');
+						if (!direct) assert.equal(init.redirect, 'manual');
+						return new Response(new ReadableStream({ start(controller) {
+							// Split both SSE lines and UTF-8 characters across network chunks.
+							const bytes = new TextEncoder().encode(wire);
+							for (let i = 0; i < bytes.length; i += 11) controller.enqueue(bytes.slice(i, i + 11));
+							controller.close();
+						} }), { headers: { 'Content-Type': 'text/event-stream' } });
+					});
+					await sendCompanionMessage('Hello', [], hooks);
+					assert.equal(chatStore.error, null);
+					// Thinking covers the wait for the first text, then clears
+					assert.equal(thinking[0], true);
+					assert.equal(thinking.at(-1), false);
+					assert.deepEqual(spoken.map((s) => [s.text, s.language]), [
+						['Let me know how your interview goes.', 'en'], ['Hola, buenos días.', 'es']
+					]);
+					assert.equal(latest, 'Let me know how your interview goes. Hola, buenos días.');
+					assert.equal(messages.at(-1)?.content, latest);
+					assert.equal(turns.at(-1)?.stateUpdates?.newMemory, 'They are learning Spanish');
+					assert.equal(turns.at(-1)?.stateUpdates?.moodChange?.emotion, 'happy');
+				});
+			}
+		}
+		await t.test('Anthropic receives inline instructions and speech-off requests receive no tools', async (t) => {
+			direct = true; llmProvider = 'anthropic';
+			for (const enabled of [true, false]) {
+				speechEnabled = enabled; speechStarted = false; messages.length = 0; spoken = [];
+				t.mock.method(globalThis, 'fetch', async (_url: string, init: RequestInit) => {
+					const body = JSON.parse(String(init.body));
+					assert.equal(body.tools, undefined);
+					assert.equal(body.system.includes('inline speak() commands'), enabled);
+					assert.equal(body.system.includes('native tool calls'), false);
+					return new Response(`data: ${JSON.stringify({ type: 'content_block_delta', delta: { text: 'speak({"text":"Hello there.","lang":"en"})' + state } })}\n\n`);
+				});
+				await sendCompanionMessage('Hello', [], hooks);
+				assert.equal(chatStore.error, null);
+				assert.equal(latest, 'Hello there.');
+				assert.equal(speechStarted, enabled);
+			}
+		});
+		await t.test('MCP tool loop executes the tool, feeds the result back and then speaks', async (t) => {
+			direct = false; llmProvider = 'openai-compatible';
+			speechEnabled = true; messages.length = 0; spoken = []; turns.length = 0;
+			const mcp = fixtures.mcpStore as {
+				hasActiveTools: boolean;
+				tools: unknown[];
+				servers: unknown[];
+			};
+			mcp.hasActiveTools = true;
+			mcp.tools = [{
+				serverId: 'ha', serverName: 'Home Assistant', name: 'get_state',
+				description: 'Read an entity state', inputSchema: { type: 'object' }
+			}];
+			mcp.servers = [{ id: 'ha', name: 'Home Assistant', transport: 'http', url: 'http://ha.local/api/mcp', enabled: true }];
+
+			let providerRound = 0;
+			const toolCallWire = `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: 'get_state', arguments: '{}' } }] } }] })}\n\n` + 'data: [DONE]\n\n';
+			const speechWire = `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_2', type: 'function', function: { name: 'speak_segment', arguments: JSON.stringify({ text: 'It is 21 degrees.', language: 'en' }) } }] } }] })}\n\n` + 'data: [DONE]\n\n';
+
+			t.mock.method(globalThis, 'fetch', async (url: string, init: RequestInit) => {
+				if (url === '/api/chat') {
+					if (providerRound === 1) {
+						const body = JSON.parse(String(init.body));
+						const toolMessage = body.messages.find((m: { role: string }) => m.role === 'tool');
+						assert.ok(toolMessage, 'the tool result is fed back into the second round');
+						assert.equal(toolMessage.content, '21 degrees');
+						assert.equal(body.messages.some((m: { role: string; tool_calls?: unknown }) => m.role === 'assistant' && m.tool_calls), true);
+					}
+					return POST({ request: new Request('http://localhost/api/chat', init) });
+				}
+				if (url === '/api/mcp/call') {
+					const body = JSON.parse(String(init.body));
+					assert.equal(body.toolName, 'get_state');
+					return new Response(JSON.stringify({ toolName: 'get_state', content: '21 degrees', isError: false }), {
+						headers: { 'Content-Type': 'application/json' }
+					});
+				}
+				const wire = providerRound === 0 ? toolCallWire : speechWire;
+				providerRound++;
+				return new Response(new ReadableStream({ start(controller) {
+					controller.enqueue(new TextEncoder().encode(wire));
+					controller.close();
+				} }), { headers: { 'Content-Type': 'text/event-stream' } });
+			});
+
+			await sendCompanionMessage('How warm is it?', [], hooks);
+			assert.equal(chatStore.error, null);
+			assert.equal(providerRound, 2, 'the model runs again after the tool result');
+			assert.deepEqual(spoken.map((s) => [s.text, s.language]), [['It is 21 degrees.', 'en']]);
+			assert.equal(latest, 'It is 21 degrees.');
+			mcp.hasActiveTools = false; mcp.tools = []; mcp.servers = [];
+		});
+		await t.test('a failing MCP tool call is fed back as an error result', async (t) => {
+			direct = false; llmProvider = 'openai-compatible';
+			speechEnabled = true; messages.length = 0; spoken = []; turns.length = 0;
+			const mcp = fixtures.mcpStore as {
+				hasActiveTools: boolean;
+				tools: unknown[];
+				servers: unknown[];
+			};
+			mcp.hasActiveTools = true;
+			mcp.tools = [{
+				serverId: 'ha', serverName: 'Home Assistant', name: 'get_state',
+				description: 'Read an entity state', inputSchema: { type: 'object' }
+			}];
+			mcp.servers = [{ id: 'ha', name: 'Home Assistant', transport: 'http', url: 'http://ha.local/api/mcp', enabled: true }];
+
+			let providerRound = 0;
+			const toolCallWire = `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: 'get_state', arguments: '{}' } }] } }] })}\n\n` + 'data: [DONE]\n\n';
+			const speechWire = `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_2', type: 'function', function: { name: 'speak_segment', arguments: JSON.stringify({ text: 'The sensor is offline.', language: 'en' }) } }] } }] })}\n\n` + 'data: [DONE]\n\n';
+
+			t.mock.method(globalThis, 'fetch', async (url: string, init: RequestInit) => {
+				if (url === '/api/chat') {
+					if (providerRound === 1) {
+						const body = JSON.parse(String(init.body));
+						const toolMessage = body.messages.find((m: { role: string }) => m.role === 'tool');
+						assert.ok(toolMessage, 'the failed tool result is still fed back');
+						assert.match(toolMessage.content, /Error: network down/);
+					}
+					return POST({ request: new Request('http://localhost/api/chat', init) });
+				}
+				if (url === '/api/mcp/call') throw new Error('network down');
+				const wire = providerRound === 0 ? toolCallWire : speechWire;
+				providerRound++;
+				return new Response(new ReadableStream({ start(controller) {
+					controller.enqueue(new TextEncoder().encode(wire));
+					controller.close();
+				} }), { headers: { 'Content-Type': 'text/event-stream' } });
+			});
+
+			await sendCompanionMessage('How warm is it?', [], hooks);
+			assert.equal(chatStore.error, null, 'the turn survives a failing tool call');
+			assert.equal(providerRound, 2, 'the model runs again after the failed tool result');
+			assert.deepEqual(spoken.map((s) => [s.text, s.language]), [['The sensor is offline.', 'en']]);
+			mcp.hasActiveTools = false; mcp.tools = []; mcp.servers = [];
+		});
+		await t.test('the MCP loop stops at the round budget and strips intermediate state fences', async (t) => {
+			direct = false; llmProvider = 'openai-compatible';
+			speechEnabled = false; messages.length = 0; spoken = []; turns.length = 0;
+			const mcp = fixtures.mcpStore as {
+				hasActiveTools: boolean;
+				tools: unknown[];
+				servers: unknown[];
+			};
+			mcp.hasActiveTools = true;
+			mcp.tools = [{
+				serverId: 'ha', serverName: 'Home Assistant', name: 'get_state',
+				description: 'Read an entity state', inputSchema: { type: 'object' }
+			}];
+			mcp.servers = [{ id: 'ha', name: 'Home Assistant', transport: 'http', url: 'http://ha.local/api/mcp', enabled: true }];
+
+			let providerRound = 0;
+			let toolCalls = 0;
+			t.mock.method(globalThis, 'fetch', async (url: string, init: RequestInit) => {
+				if (url === '/api/chat') {
+					if (providerRound === 4) {
+						const body = JSON.parse(String(init.body));
+						const note = body.messages.find(
+							(m: { role: string; content?: string }) =>
+								m.role === 'user' && String(m.content).includes('tool budget reached')
+						);
+						assert.ok(note, 'the final round tells the model the budget is spent');
+					}
+					return POST({ request: new Request('http://localhost/api/chat', init) });
+				}
+				if (url === '/api/mcp/call') {
+					toolCalls++;
+					return new Response(JSON.stringify({ toolName: 'get_state', content: 'ok', isError: false }), {
+						headers: { 'Content-Type': 'application/json' }
+					});
+				}
+				const n = providerRound++;
+				const fence = '\n```json\n{"new_memory":"round ' + n + '"}\n```\nrepeat ' + n;
+				const events = [
+					{ choices: [{ delta: { content: 'Round ' + n + '.' + fence } }] },
+					{ choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_' + n, type: 'function', function: { name: 'get_state', arguments: '{}' } }] } }] }
+				];
+				const wire = events.map((e) => `data: ${JSON.stringify(e)}\n\n`).join('') + 'data: [DONE]\n\n';
+				return new Response(new TextEncoder().encode(wire), { headers: { 'Content-Type': 'text/event-stream' } });
+			});
+
+			await sendCompanionMessage('Status?', [], hooks);
+			assert.equal(chatStore.error, null);
+			assert.equal(providerRound, 5, 'the loop stops after MCP_MAX_ROUNDS rounds');
+			assert.equal(toolCalls, 4, 'the final round executes no further tools');
+			assert.equal(turns.at(-1)?.stateUpdates?.newMemory, 'round 4', 'only the final round state block is parsed');
+			mcp.hasActiveTools = false; mcp.tools = []; mcp.servers = [];
+		});
+		await t.test('text and an MCP tool call in the same round are both preserved', async (t) => {
+			direct = false; llmProvider = 'openai-compatible'; contextSize = 4096;
+			speechEnabled = true; messages.length = 0; spoken = []; turns.length = 0;
+			const mcp = fixtures.mcpStore as {
+				hasActiveTools: boolean;
+				tools: unknown[];
+				servers: unknown[];
+			};
+			mcp.hasActiveTools = true;
+			mcp.tools = [{
+				serverId: 'ha', serverName: 'Home Assistant', name: 'get_state',
+				description: 'Read an entity state', inputSchema: { type: 'object' }
+			}];
+			mcp.servers = [{ id: 'ha', name: 'Home Assistant', transport: 'http', url: 'http://ha.local/api/mcp', enabled: true, injectResultsAsUser: true }];
+
+			let providerRound = 0;
+			const mixedWire = `data: ${JSON.stringify({ choices: [{ delta: { content: 'Let me check the sensor. ' } }] })}\n\n` +
+				`data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: 'get_state', arguments: '{}' } }] } }] })}\n\n` + 'data: [DONE]\n\n';
+			const speechWire = `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_2', type: 'function', function: { name: 'speak_segment', arguments: JSON.stringify({ text: 'It is 21 degrees.', language: 'en' }) } }] } }] })}\n\n` + 'data: [DONE]\n\n';
+
+			t.mock.method(globalThis, 'fetch', async (url: string, init: RequestInit) => {
+				if (url === '/api/chat') {
+					if (providerRound === 1) {
+						const body = JSON.parse(String(init.body));
+						assert.ok(body.messages.some((m: { content: string }) => m.content === 'How warm is it?'));
+						assert.deepEqual(body.messages.map((m: { role: string }) => m.role), ['user', 'assistant', 'tool', 'user']);
+					}
+					return POST({ request: new Request('http://localhost/api/chat', init) });
+				}
+				if (url === '/api/mcp/call') {
+					const body = JSON.parse(String(init.body));
+					assert.equal(body.toolName, 'get_state');
+					return new Response(JSON.stringify({ toolName: 'get_state', content: '21 degrees. '.repeat(1000), isError: false }), {
+						headers: { 'Content-Type': 'application/json' }
+					});
+				}
+				const wire = providerRound === 0 ? mixedWire : speechWire;
+				providerRound++;
+				return new Response(new TextEncoder().encode(wire), { headers: { 'Content-Type': 'text/event-stream' } });
+			});
+
+			await sendCompanionMessage('How warm is it?', [], hooks);
+			assert.equal(chatStore.error, null);
+			assert.equal(providerRound, 2, 'the model runs again after the tool result');
+			const dialogue = turns.at(-1)?.dialogue ?? '';
+			assert.match(dialogue, /Let me check the sensor\./);
+			assert.match(dialogue, /It is 21 degrees\./);
+			mcp.hasActiveTools = false; mcp.tools = []; mcp.servers = []; contextSize = undefined;
+		});
+		await t.test('Anthropic never receives MCP tool definitions', async (t) => {
+			direct = true; llmProvider = 'anthropic';
+			speechEnabled = false; messages.length = 0; spoken = []; turns.length = 0;
+			const mcp = fixtures.mcpStore as {
+				hasActiveTools: boolean;
+				tools: unknown[];
+				servers: unknown[];
+			};
+			mcp.hasActiveTools = true;
+			mcp.tools = [{
+				serverId: 'ha', serverName: 'Home Assistant', name: 'get_state',
+				description: 'Read an entity state', inputSchema: { type: 'object' }
+			}];
+			mcp.servers = [{ id: 'ha', name: 'Home Assistant', transport: 'http', url: 'http://ha.local/api/mcp', enabled: true }];
+
+			t.mock.method(globalThis, 'fetch', async (_url: string, init: RequestInit) => {
+				const body = JSON.parse(String(init.body));
+				assert.equal(body.tools, undefined, 'MCP tools are not sent on the Anthropic path');
+				return new Response(`data: ${JSON.stringify({ type: 'content_block_delta', delta: { text: 'Hello there.' } })}\n\n`);
+			});
+
+			await sendCompanionMessage('Hello', [], hooks);
+			assert.equal(chatStore.error, null);
+			mcp.hasActiveTools = false; mcp.tools = []; mcp.servers = [];
+		});
+		await t.test('a confirmation-listed tool is never executed and reported back', async (t) => {
+			direct = false; llmProvider = 'openai-compatible';
+			speechEnabled = true; messages.length = 0; spoken = []; turns.length = 0;
+			const mcp = fixtures.mcpStore as {
+				hasActiveTools: boolean;
+				tools: unknown[];
+				servers: unknown[];
+			};
+			mcp.hasActiveTools = true;
+			mcp.tools = [{
+				serverId: 'ha', serverName: 'Home Assistant', name: 'get_state',
+				description: 'Read an entity state', inputSchema: { type: 'object' }
+			}];
+			mcp.servers = [{ id: 'ha', name: 'Home Assistant', transport: 'http', url: 'http://ha.local/api/mcp', enabled: true }];
+			fixtures.publicEnv.PUBLIC_MCP_CONFIRM_TOOLS = 'get_state';
+
+			let providerRound = 0;
+			let mcpCalls = 0;
+			const toolCallWire = `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: 'get_state', arguments: '{}' } }] } }] })}\n\n` + 'data: [DONE]\n\n';
+			const speechWire = `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_2', type: 'function', function: { name: 'speak_segment', arguments: JSON.stringify({ text: 'It needs your confirmation.', language: 'en' }) } }] } }] })}\n\n` + 'data: [DONE]\n\n';
+
+			t.mock.method(globalThis, 'fetch', async (url: string, init: RequestInit) => {
+				if (url === '/api/chat') {
+					if (providerRound === 1) {
+						const body = JSON.parse(String(init.body));
+						const toolMessage = body.messages.find((m: { role: string }) => m.role === 'tool');
+						assert.ok(toolMessage, 'the blocked call still gets a tool result');
+						assert.match(toolMessage.content, /requires manual user confirmation/);
+					}
+					return POST({ request: new Request('http://localhost/api/chat', init) });
+				}
+				if (url === '/api/mcp/call') {
+					mcpCalls++;
+					return new Response(JSON.stringify({ toolName: 'get_state', content: 'should not run', isError: false }), {
+						headers: { 'Content-Type': 'application/json' }
+					});
+				}
+				const wire = providerRound === 0 ? toolCallWire : speechWire;
+				providerRound++;
+				return new Response(new ReadableStream({ start(controller) {
+					controller.enqueue(new TextEncoder().encode(wire));
+					controller.close();
+				} }), { headers: { 'Content-Type': 'text/event-stream' } });
+			});
+
+			await sendCompanionMessage('Check the sensor', [], hooks);
+			assert.equal(chatStore.error, null);
+			assert.equal(mcpCalls, 0, 'the blocked tool never reaches the MCP call route');
+			assert.equal(providerRound, 2, 'the model still answers after the blocked call');
+			assert.deepEqual(spoken.map((s) => [s.text, s.language]), [['It needs your confirmation.', 'en']]);
+			delete fixtures.publicEnv.PUBLIC_MCP_CONFIRM_TOOLS;
+			mcp.hasActiveTools = false; mcp.tools = []; mcp.servers = [];
+		});
+		await t.test('the MCP call route rejects confirmation-listed tools', async () => {
+			fixtures.publicEnv.PUBLIC_MCP_CONFIRM_TOOLS = 'get_state';
+			fixtures.privateEnv.MCP_ENABLED = 'server';
+			const { POST: callPOST } = await server.ssrLoadModule('/src/routes/api/mcp/call/+server.ts');
+			const response = await callPOST({
+				request: new Request('http://localhost/api/mcp/call', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({
+						server: { id: 'ha', name: 'Home Assistant', transport: 'http', url: 'http://ha.local/api/mcp', enabled: true },
+						toolName: 'get_state',
+						args: {}
+					})
+				})
+			});
+			assert.equal(response.status, 403);
+			const body = (await response.json()) as { error?: string };
+			assert.match(body.error ?? '', /requires manual user confirmation/);
+			delete fixtures.publicEnv.PUBLIC_MCP_CONFIRM_TOOLS;
+			delete fixtures.privateEnv.MCP_ENABLED;
+		});
+		await t.test('the MCP call route rejects stdio commands outside the allowlist', async () => {
+			fixtures.privateEnv.MCP_ENABLED = 'server';
+			fixtures.privateEnv.MCP_STDIO_ALLOWED_COMMANDS = 'npx';
+			const { POST: callPOST } = await server.ssrLoadModule('/src/routes/api/mcp/call/+server.ts');
+			const response = await callPOST({
+				request: new Request('http://localhost/api/mcp/call', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({
+						server: { id: 'evil', name: 'Evil', transport: 'stdio', command: 'rm', args: ['-rf', '/'], enabled: true },
+						toolName: 'do_it',
+						args: {}
+					})
+				})
+			});
+			assert.equal(response.status, 403);
+			const body = (await response.json()) as { error?: string };
+			assert.match(body.error ?? '', /MCP_STDIO_ALLOWED_COMMANDS/);
+			delete fixtures.privateEnv.MCP_ENABLED;
+			delete fixtures.privateEnv.MCP_STDIO_ALLOWED_COMMANDS;
+		});
+		await t.test('an unknown tool call is answered with an error result', async (t) => {
+			direct = true; llmProvider = 'openai-compatible';
+			speechEnabled = false; messages.length = 0; spoken = []; turns.length = 0;
+			const mcp = fixtures.mcpStore as {
+				hasActiveTools: boolean;
+				tools: unknown[];
+				servers: unknown[];
+			};
+			mcp.hasActiveTools = true;
+			mcp.tools = [{
+				serverId: 'ha', serverName: 'Home Assistant', name: 'get_state',
+				description: 'Read an entity state', inputSchema: { type: 'object' }
+			}];
+			mcp.servers = [{ id: 'ha', name: 'Home Assistant', transport: 'http', url: 'http://ha.local/api/mcp', enabled: true }];
+
+			let providerRound = 0;
+			const round0 = `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [
+				{ index: 0, id: 'call_1', type: 'function', function: { name: 'get_state', arguments: '{}' } },
+				{ index: 1, id: 'call_2', type: 'function', function: { name: 'make_coffee', arguments: '{}' } }
+			] } }] })}\n\n` + 'data: [DONE]\n\n';
+			const round1 = `data: ${JSON.stringify({ choices: [{ delta: { content: 'Done.' } }] })}\n\n` + 'data: [DONE]\n\n';
+
+			t.mock.method(globalThis, 'fetch', async (url: string, init: RequestInit) => {
+				if (url === '/api/mcp/call') {
+					return new Response(JSON.stringify({ toolName: 'get_state', content: 'ok', isError: false }), {
+						headers: { 'Content-Type': 'application/json' }
+					});
+				}
+				if (providerRound === 1) {
+					const body = JSON.parse(String(init.body));
+					const toolMessages = body.messages.filter((m: { role: string }) => m.role === 'tool');
+					const unknown = toolMessages.find((m: { content: string }) =>
+						String(m.content).includes('unknown tool')
+					);
+					assert.ok(unknown, 'the hallucinated tool gets an error result');
+					assert.match(String(unknown.content), /make_coffee/);
+				}
+				const wire = providerRound === 0 ? round0 : round1;
+				providerRound++;
+				return new Response(new TextEncoder().encode(wire), { headers: { 'Content-Type': 'text/event-stream' } });
+			});
+
+			await sendCompanionMessage('Check it', [], hooks);
+			assert.equal(chatStore.error, null);
+			assert.equal(providerRound, 2, 'the model runs again after the mixed tool round');
+			mcp.hasActiveTools = false; mcp.tools = []; mcp.servers = [];
+		});
+		await t.test('a command-line allowlist rejects node -e even though node is listed', async () => {
+			fixtures.privateEnv.MCP_ENABLED = 'server';
+			fixtures.privateEnv.MCP_STDIO_ALLOWED_COMMANDS = 'node ./.e2e-tmp/echo-server.mjs';
+			const { POST: callPOST } = await server.ssrLoadModule('/src/routes/api/mcp/call/+server.ts');
+			const response = await callPOST({
+				request: new Request('http://localhost/api/mcp/call', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({
+						server: { id: 'x', name: 'X', transport: 'stdio', command: 'node', args: ['-e', 'process.exit(0)'], enabled: true },
+						toolName: 'echo',
+						args: {}
+					})
+				})
+			});
+			assert.equal(response.status, 403);
+			const body = (await response.json()) as { error?: string };
+			assert.match(body.error ?? '', /not allowed/);
+			delete fixtures.privateEnv.MCP_ENABLED;
+			delete fixtures.privateEnv.MCP_STDIO_ALLOWED_COMMANDS;
+		});
+		await t.test('the MCP call route disables stdio without an allowlist', async () => {
+			fixtures.privateEnv.MCP_ENABLED = 'server';
+			const { POST: callPOST } = await server.ssrLoadModule('/src/routes/api/mcp/call/+server.ts');
+			const response = await callPOST({
+				request: new Request('http://localhost/api/mcp/call', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({
+						server: { id: 'brave', name: 'Brave', transport: 'stdio', command: 'npx', args: [], enabled: true },
+						toolName: 'search',
+						args: {}
+					})
+				})
+			});
+			assert.equal(response.status, 403);
+			const body = (await response.json()) as { error?: string };
+			assert.match(body.error ?? '', /stdio is disabled/);
+			delete fixtures.privateEnv.MCP_ENABLED;
+		});
+		await t.test('the tools route reports fail-closed stdio as a per-server error', async () => {
+			fixtures.privateEnv.MCP_ENABLED = 'server';
+			const { POST: toolsPOST } = await server.ssrLoadModule('/src/routes/api/mcp/tools/+server.ts');
+			const response = await toolsPOST({
+				request: new Request('http://localhost/api/mcp/tools', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({
+						servers: [{ id: 'brave', name: 'Brave', transport: 'stdio', command: 'npx', args: [], enabled: true }]
+					})
+				})
+			});
+			assert.equal(response.status, 200);
+			const body = (await response.json()) as {
+				tools: unknown[];
+				errors: Array<{ message: string }>;
+			};
+			assert.equal(body.tools.length, 0);
+			assert.match(body.errors[0]?.message ?? '', /stdio is disabled/);
+			delete fixtures.privateEnv.MCP_ENABLED;
+		});
+		await t.test('a server disabled mid-turn is not executed', async (t) => {
+			direct = false; llmProvider = 'openai-compatible';
+			speechEnabled = false; messages.length = 0; spoken = []; turns.length = 0;
+			const mcp = fixtures.mcpStore as {
+				hasActiveTools: boolean;
+				tools: unknown[];
+				servers: unknown[];
+			};
+			mcp.hasActiveTools = true;
+			mcp.tools = [{
+				serverId: 'ha', serverName: 'Home Assistant', name: 'get_state',
+				description: 'Read an entity state', inputSchema: { type: 'object' }
+			}];
+			mcp.servers = [{ id: 'ha', name: 'Home Assistant', transport: 'http', url: 'http://ha.local/api/mcp', enabled: true }];
+
+			let providerRound = 0;
+			let mcpCalls = 0;
+			const toolCallWire = `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: 'get_state', arguments: '{}' } }] } }] })}\n\n` + 'data: [DONE]\n\n';
+			const answerWire = `data: ${JSON.stringify({ choices: [{ delta: { content: 'Done.' } }] })}\n\n` + 'data: [DONE]\n\n';
+
+			t.mock.method(globalThis, 'fetch', async (url: string, init: RequestInit) => {
+				if (url === '/api/chat') {
+					if (providerRound === 1) {
+						const body = JSON.parse(String(init.body));
+						const toolMessage = body.messages.find((m: { role: string }) => m.role === 'tool');
+						assert.match(toolMessage.content, /no enabled MCP server/);
+					}
+					return POST({ request: new Request('http://localhost/api/chat', init) });
+				}
+				if (url === '/api/mcp/call') {
+					mcpCalls++;
+					return new Response(JSON.stringify({ toolName: 'get_state', content: 'should not run', isError: false }), {
+						headers: { 'Content-Type': 'application/json' }
+					});
+				}
+				if (providerRound === 0) {
+					// Disable the server after the tool snapshot was taken.
+					mcp.servers = [{ id: 'ha', name: 'Home Assistant', transport: 'http', url: 'http://ha.local/api/mcp', enabled: false }];
+				}
+				const wire = providerRound === 0 ? toolCallWire : answerWire;
+				providerRound++;
+				return new Response(new TextEncoder().encode(wire), { headers: { 'Content-Type': 'text/event-stream' } });
+			});
+
+			await sendCompanionMessage('Check it', [], hooks);
+			assert.equal(chatStore.error, null);
+			assert.equal(mcpCalls, 0, 'a disabled server is never contacted');
+			mcp.hasActiveTools = false; mcp.tools = []; mcp.servers = [];
+		});
+		for (const [label, server, answer] of [
+			['a declined confirmation skips the tool', {}, false],
+			['an approved confirmation runs the tool', {}, true],
+			['a server with ask-before-run off never prompts', { askBeforeRun: false }, false]
+		] as const) {
+			await t.test(label, async (t) => {
+				direct = false; llmProvider = 'openai-compatible';
+				speechEnabled = false; messages.length = 0; spoken = []; turns.length = 0;
+				const mcp = fixtures.mcpStore;
+				mcp.confirmations.length = 0;
+				mcp.confirmAnswer = answer;
+				(mcp as { hasActiveTools: boolean }).hasActiveTools = true;
+				(mcp as { tools: unknown[] }).tools = [{
+					serverId: 'ha', serverName: 'Home Assistant', name: 'unlock_door',
+					description: 'Unlock a door', inputSchema: { type: 'object' }
+				}];
+				(mcp as { servers: unknown[] }).servers = [{
+					id: 'ha', name: 'Home Assistant', transport: 'http', url: 'http://ha.local/api/mcp', enabled: true, ...server
+				}];
+
+				const prompts = !('askBeforeRun' in server);
+				const runs = !prompts || answer;
+				let providerRound = 0;
+				let mcpCalls = 0;
+				let toolResult = '';
+				const toolCallWire = `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: 'unlock_door', arguments: '{"door":"front"}' } }] } }] })}\n\n` + 'data: [DONE]\n\n';
+				const answerWire = `data: ${JSON.stringify({ choices: [{ delta: { content: 'Done.' } }] })}\n\n` + 'data: [DONE]\n\n';
+
+				t.mock.method(globalThis, 'fetch', async (url: string, init: RequestInit) => {
+					if (url === '/api/mcp/call') {
+						mcpCalls++;
+						return new Response(JSON.stringify({ toolName: 'unlock_door', content: 'unlocked', isError: false }), {
+							headers: { 'Content-Type': 'application/json' }
+						});
+					}
+					if (url === '/api/chat') {
+						if (providerRound === 1) {
+							const body = JSON.parse(String(init.body));
+							toolResult = body.messages.find((m: { role: string }) => m.role === 'tool')?.content ?? '';
+						}
+						return POST({ request: new Request('http://localhost/api/chat', init) });
+					}
+					const wire = providerRound === 0 ? toolCallWire : answerWire;
+					providerRound++;
+					return new Response(new TextEncoder().encode(wire), { headers: { 'Content-Type': 'text/event-stream' } });
+				});
+
+				await sendCompanionMessage('Open the front door', [], hooks);
+				assert.equal(chatStore.error, null);
+				assert.deepEqual(
+					mcp.confirmations,
+					prompts ? [{ serverName: 'Home Assistant', toolName: 'unlock_door', args: { door: 'front' } }] : []
+				);
+				assert.equal(mcpCalls, runs ? 1 : 0);
+				assert.match(toolResult, runs ? /unlocked/ : /declined.*NOT executed/);
+				assert.equal(providerRound, 2, 'the model answers after the tool round');
+				mcp.confirmAnswer = true;
+				(mcp as { hasActiveTools: boolean }).hasActiveTools = false;
+				(mcp as { tools: unknown[] }).tools = [];
+				(mcp as { servers: unknown[] }).servers = [];
+			});
+		}
+		await t.test('tool errors are prefixed for the model', async (t) => {
+			direct = false; llmProvider = 'openai-compatible';
+			speechEnabled = false; messages.length = 0; spoken = []; turns.length = 0;
+			const mcp = fixtures.mcpStore as {
+				hasActiveTools: boolean;
+				tools: unknown[];
+				servers: unknown[];
+			};
+			mcp.hasActiveTools = true;
+			mcp.tools = [{
+				serverId: 'ha', serverName: 'Home Assistant', name: 'get_state',
+				description: 'Read an entity state', inputSchema: { type: 'object' }
+			}];
+			mcp.servers = [{ id: 'ha', name: 'Home Assistant', transport: 'http', url: 'http://ha.local/api/mcp', enabled: true }];
+
+			let providerRound = 0;
+			const toolCallWire = `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: 'get_state', arguments: '{}' } }] } }] })}\n\n` + 'data: [DONE]\n\n';
+			const answerWire = `data: ${JSON.stringify({ choices: [{ delta: { content: 'Done.' } }] })}\n\n` + 'data: [DONE]\n\n';
+
+			t.mock.method(globalThis, 'fetch', async (url: string, init: RequestInit) => {
+				if (url === '/api/chat') {
+					if (providerRound === 1) {
+						const body = JSON.parse(String(init.body));
+						const toolMessage = body.messages.find((m: { role: string }) => m.role === 'tool');
+						assert.equal(toolMessage.content, 'Error: sensor offline');
+					}
+					return POST({ request: new Request('http://localhost/api/chat', init) });
+				}
+				if (url === '/api/mcp/call') {
+					return new Response(JSON.stringify({ toolName: 'get_state', content: 'sensor offline', isError: true }), {
+						headers: { 'Content-Type': 'application/json' }
+					});
+				}
+				const wire = providerRound === 0 ? toolCallWire : answerWire;
+				providerRound++;
+				return new Response(new TextEncoder().encode(wire), { headers: { 'Content-Type': 'text/event-stream' } });
+			});
+
+			await sendCompanionMessage('Check it', [], hooks);
+			assert.equal(chatStore.error, null);
+			mcp.hasActiveTools = false; mcp.tools = []; mcp.servers = [];
+		});
+		await t.test('injectResultsAsUser adds a user-side copy of the tool result', async (t) => {
+			direct = false; llmProvider = 'openai-compatible';
+			speechEnabled = false; messages.length = 0; spoken = []; turns.length = 0;
+			const mcp = fixtures.mcpStore as {
+				hasActiveTools: boolean;
+				tools: unknown[];
+				servers: unknown[];
+			};
+			mcp.hasActiveTools = true;
+			mcp.tools = [{
+				serverId: 'ha', serverName: 'Home Assistant', name: 'get_state',
+				description: 'Read an entity state', inputSchema: { type: 'object' }
+			}];
+			mcp.servers = [{
+				id: 'ha', name: 'Home Assistant', transport: 'http', url: 'http://ha.local/api/mcp',
+				enabled: true, injectResultsAsUser: true
+			}];
+
+			let providerRound = 0;
+			const toolCallWire = `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: 'get_state', arguments: '{}' } }] } }] })}\n\n` + 'data: [DONE]\n\n';
+			const answerWire = `data: ${JSON.stringify({ choices: [{ delta: { content: 'Done.' } }] })}\n\n` + 'data: [DONE]\n\n';
+
+			t.mock.method(globalThis, 'fetch', async (url: string, init: RequestInit) => {
+				if (url === '/api/chat') {
+					if (providerRound === 1) {
+						const body = JSON.parse(String(init.body));
+						const injected = body.messages.some(
+							(m: { role: string; content?: string }) =>
+								m.role === 'user' && String(m.content).includes('21 degrees')
+						);
+						assert.ok(injected, 'the tool result is repeated as a user-side note');
+					}
+					return POST({ request: new Request('http://localhost/api/chat', init) });
+				}
+				if (url === '/api/mcp/call') {
+					return new Response(JSON.stringify({ toolName: 'get_state', content: '21 degrees', isError: false }), {
+						headers: { 'Content-Type': 'application/json' }
+					});
+				}
+				const wire = providerRound === 0 ? toolCallWire : answerWire;
+				providerRound++;
+				return new Response(new TextEncoder().encode(wire), { headers: { 'Content-Type': 'text/event-stream' } });
+			});
+
+			await sendCompanionMessage('How warm is it?', [], hooks);
+			assert.equal(chatStore.error, null);
+			mcp.hasActiveTools = false; mcp.tools = []; mcp.servers = [];
+		});
+
+		const sse = (text: string) => `data: ${JSON.stringify({ choices: [{ delta: { content: text } }] })}\n\n`;
+		// A stream that sends one chunk (if any) and then stalls, erroring only on abort like real fetch.
+		const hangingStream = (signal: AbortSignal | null | undefined, first?: string) =>
+			new Response(new ReadableStream({ start(controller) {
+				if (first) controller.enqueue(new TextEncoder().encode(first));
+				signal?.addEventListener('abort', () => controller.error(signal.reason));
+			} }), { headers: { 'Content-Type': 'text/event-stream' } });
+		const resetTurn = () => {
+			messages.length = 0; spoken = []; turns.length = 0; thinking.length = 0;
+			hints.length = 0; said.length = 0; cancels = 0; chatStore.error = null;
+			fixtures.chatDraftStore.draft = ''; fixtures.chatDraftStore.pending.length = 0;
+		};
+
+		await t.test('the direct transport rejects instead of resolving silently when the key is missing', async () => {
+			direct = true;
+			await assert.rejects(
+				streamChat({ messages: [], provider: 'openai', model: 'm', systemPrompt: '' }, () => {}),
+				/API key required/
+			);
+		});
+		await t.test('a transport that throws before streaming still settles the turn', { timeout: 5000 }, async () => {
+			direct = true; llmProvider = 'openai-compatible'; speechEnabled = true; resetTurn();
+			const settings = fixtures.settingsStore;
+			const original = settings.getProviderConfig;
+			// A corrupted base URL makes the direct transport throw before it fetches.
+			settings.getProviderConfig = () => ({ apiKey: 'test-key', baseUrl: 42 as unknown as string });
+			try {
+				await sendCompanionMessage('Hello', [], hooks);
+			} finally {
+				settings.getProviderConfig = original;
+			}
+			assert.equal(chatStore.isLoading, false);
+			assert.ok(chatStore.error, 'the failure is surfaced');
+			assert.equal(thinking.at(-1), false);
+		});
+		for (const transport of ['direct', 'hosted']) {
+			await t.test(`${transport}: cancelActiveTurn stops the reply mid-stream`, { timeout: 5000 }, async (t) => {
+				direct = transport === 'direct'; llmProvider = 'openai-compatible'; speechEnabled = true; resetTurn();
+				let typing = true;
+				let firstChunk!: () => void;
+				const gotChunk = new Promise<void>((resolve) => (firstChunk = resolve));
+				t.mock.method(globalThis, 'fetch', async (_url: string, init: RequestInit) => {
+					const first = direct ? sse('Hello the') : `0:${JSON.stringify('Hello the')}\n`;
+					setTimeout(firstChunk, 10);
+					return hangingStream(init.signal, first);
+				});
+				const turn = sendCompanionMessage('Hello', [], { ...hooks, setTyping: (v: boolean) => { typing = v; } });
+				await gotChunk;
+				assert.equal(chatStore.isLoading, true);
+				cancelActiveTurn();
+				await turn;
+				assert.equal(chatStore.isLoading, false);
+				assert.equal(chatStore.error, null);
+				assert.deepEqual(hints, ['Stopped']);
+				assert.equal(typing, false);
+				assert.equal(thinking.at(-1), false);
+				assert.equal(cancels, 1, 'streaming speech is cancelled');
+				assert.equal(turns.length, 0, 'the stopped turn is not processed');
+				assert.deepEqual(said, []);
+			});
+		}
+		await t.test('a stalled reply times out on its own', { timeout: 5000 }, async (t) => {
+			direct = false; llmProvider = 'openai-compatible'; speechEnabled = false; resetTurn();
+			t.mock.method(globalThis, 'fetch', async (_url: string, init: RequestInit) => hangingStream(init.signal));
+			await sendCompanionMessage('Hello', [], hooks, { stallTimeoutMs: 30 });
+			assert.equal(chatStore.isLoading, false);
+			assert.deepEqual(hints, ['Reply timed out']);
+			// The next turn is not locked out
+			t.mock.method(globalThis, 'fetch', async () => new Response(sse('Back again.') + 'data: [DONE]\n\n'));
+			direct = true;
+			await sendCompanionMessage('Hello?', [], hooks);
+			assert.equal(latest, 'Back again.');
+		});
+		await t.test('a failed keepsake write still finalizes and speaks the reply', { timeout: 5000 }, async (t) => {
+			direct = true; llmProvider = 'openai-compatible'; speechEnabled = true; resetTurn();
+			const provider = speech.activeProvider;
+			speech.activeProvider = 'elevenlabs';
+			fixtures.keepImage = async () => { throw new Error('QuotaExceededError'); };
+			t.mock.method(console, 'debug', () => {});
+			t.mock.method(globalThis, 'fetch', async () => new Response(sse('What a view.') + 'data: [DONE]\n\n'));
+			const image = { id: 'img-1', mimeType: 'image/png', base64: 'eA==', blob: new Blob(['x'], { type: 'image/png' }) };
+			try {
+				await sendCompanionMessage('Look', [image], hooks);
+			} finally {
+				speech.activeProvider = provider;
+				fixtures.keepImage = async () => {};
+			}
+			assert.equal(chatStore.error, null);
+			assert.equal(messages.at(-1)?.content, 'What a view.');
+			assert.equal(latest, 'What a view.');
+			assert.deepEqual(said, ['What a view.']);
+			assert.equal(hints.length, 1);
+		});
+		for (const transport of ['direct', 'hosted']) {
+			await t.test(`${transport}: a busy provider is retried and the reply still lands`, { timeout: 5000 }, async (t) => {
+				direct = transport === 'direct'; llmProvider = 'openai-compatible'; speechEnabled = false; resetTurn();
+				let upstream = 0;
+				t.mock.method(globalThis, 'fetch', async (url: string, init: RequestInit) => {
+					if (url === '/api/chat') return POST({ request: new Request('http://localhost/api/chat', init) });
+					// Retry-After: 0 keeps the test instant and proves the header is honored
+					if (upstream++ === 0) {
+						return new Response(JSON.stringify({ error: { message: 'Rate limit exceeded' } }), {
+							status: 429, headers: { 'Content-Type': 'application/json', 'Retry-After': '0' }
+						});
+					}
+					return new Response(sse('Sorry, I was busy.') + 'data: [DONE]\n\n', { headers: { 'Content-Type': 'text/event-stream' } });
+				});
+				await sendCompanionMessage('Hello', [], hooks);
+				assert.equal(upstream, 2);
+				assert.equal(chatStore.error, null);
+				assert.equal(latest, 'Sorry, I was busy.');
+				assert.equal(hints.length, 1);
+				assert.match(hints[0], /retrying/i);
+			});
+			await t.test(`${transport}: a rejected key fails once and the message bounces back to the composer`, { timeout: 5000 }, async (t) => {
+				direct = transport === 'direct'; llmProvider = 'openai-compatible'; speechEnabled = false; resetTurn();
+				let upstream = 0;
+				t.mock.method(globalThis, 'fetch', async (url: string, init: RequestInit) => {
+					if (url === '/api/chat') return POST({ request: new Request('http://localhost/api/chat', init) });
+					upstream++;
+					return new Response(JSON.stringify({ error: { message: 'Invalid API key' } }), {
+						status: 401, headers: { 'Content-Type': 'application/json' }
+					});
+				});
+				const image = { id: 'img-1', mimeType: 'image/png', base64: 'eA==', blob: new Blob(['x'], { type: 'image/png' }) };
+				await sendCompanionMessage('Remember this long message?', [image], hooks);
+				assert.equal(upstream, 1);
+				// Same readable message on both paths, not xsai's raw "Remote sent 401 response: {...}"
+				assert.equal(chatStore.error, 'Invalid API key');
+				assert.equal(messages.some((m) => m.role === 'user'), false, 'the failed bubble is taken back');
+				assert.equal(fixtures.chatDraftStore.draft, 'Remember this long message?');
+				assert.equal(fixtures.chatDraftStore.pending.length, 1);
+			});
+		}
+		for (const transport of ['direct', 'hosted']) {
+			const image = { id: 'img-v', mimeType: 'image/png', base64: 'eA==', blob: new Blob(['x'], { type: 'image/png' }) };
+			// Every upstream body, in order, whichever transport carried it
+			const upstreamBodies = (t: { mock: { method: (o: object, m: string, f: (...args: never[]) => unknown) => unknown } }, reply: (body: { model: string; messages: { role: string; content: unknown }[] }) => Response) => {
+				const bodies: { model: string; messages: { role: string; content: unknown }[] }[] = [];
+				t.mock.method(globalThis, 'fetch', async (url: string, init: RequestInit) => {
+					if (url === '/api/chat') return POST({ request: new Request('http://localhost/api/chat', init) });
+					const body = JSON.parse(String(init.body));
+					bodies.push(body);
+					return reply(body);
+				});
+				return bodies;
+			};
+			await t.test(`${transport}: a separate vision model describes the photo and the chat model gets text`, { timeout: 5000 }, async (t) => {
+				direct = transport === 'direct'; llmProvider = 'openai-compatible'; speechEnabled = false; resetTurn();
+				visionEnabled = true;
+				let kept = 0;
+				fixtures.keepImage = async () => { kept++; };
+				const bodies = upstreamBodies(t, (body) => new Response(
+					sse(body.model === 'vision-model' ? 'A grey cat on a windowsill.' : 'What a sweet cat!') + 'data: [DONE]\n\n',
+					{ headers: { 'Content-Type': 'text/event-stream' } }
+				));
+				try {
+					await sendCompanionMessage('Meet Miso', [image], hooks);
+				} finally {
+					visionEnabled = false;
+					fixtures.keepImage = async () => {};
+				}
+				assert.equal(chatStore.error, null);
+				assert.deepEqual(bodies.map((b) => b.model), ['vision-model', 'test-model']);
+				const visionTurn = JSON.stringify(bodies[0].messages.at(-1));
+				assert.match(visionTurn, /data:image\/png;base64,eA==/);
+				assert.match(visionTurn, /Meet Miso/);
+				const chatTurn = bodies[1].messages.at(-1);
+				assert.equal(chatTurn?.content, 'Meet Miso\n\n[They showed you an image. What it shows: A grey cat on a windowsill.]');
+				assert.doesNotMatch(JSON.stringify(bodies[1]), /base64/);
+				assert.match(String(bodies[1].messages[0].content), /<being_shown>/);
+				assert.equal(latest, 'What a sweet cat!');
+				assert.equal(messages.at(-1)?.content, 'What a sweet cat!');
+				assert.equal(kept, 1, 'the photo is still kept on the board');
+			});
+			await t.test(`${transport}: a failing vision model stops the turn and returns the photo`, { timeout: 5000 }, async (t) => {
+				direct = transport === 'direct'; llmProvider = 'openai-compatible'; speechEnabled = false; resetTurn();
+				visionEnabled = true;
+				const bodies = upstreamBodies(t, () => new Response(JSON.stringify({ error: { message: 'Invalid API key' } }), {
+					status: 401, headers: { 'Content-Type': 'application/json' }
+				}));
+				try {
+					await sendCompanionMessage('Meet Miso', [image], hooks);
+				} finally {
+					visionEnabled = false;
+				}
+				assert.deepEqual(bodies.map((b) => b.model), ['vision-model'], 'the chat model is never asked');
+				assert.equal(chatStore.error, 'Vision model: Invalid API key');
+				assert.equal(messages.length, 0);
+				assert.equal(fixtures.chatDraftStore.draft, 'Meet Miso');
+				assert.equal(fixtures.chatDraftStore.pending.length, 1);
+			});
+		}
+		await t.test('a vision model with nothing picked never falls back to the chat model', { timeout: 5000 }, async (t) => {
+			direct = true; llmProvider = 'openai-compatible'; speechEnabled = false; resetTurn();
+			visionEnabled = true;
+			const model = visionSettings.activeModel;
+			visionSettings.activeModel = '';
+			let calls = 0;
+			t.mock.method(globalThis, 'fetch', async () => { calls++; return new Response(''); });
+			const image = { id: 'img-v', mimeType: 'image/png', base64: 'eA==', blob: new Blob(['x'], { type: 'image/png' }) };
+			try {
+				await sendCompanionMessage('Look', [image], hooks);
+			} finally {
+				visionEnabled = false;
+				visionSettings.activeModel = model;
+			}
+			assert.equal(calls, 0);
+			assert.match(chatStore.error ?? '', /Pick a vision model/);
+			assert.equal(fixtures.chatDraftStore.pending.length, 1);
+		});
+		await t.test('text-only turns skip the vision model', { timeout: 5000 }, async (t) => {
+			direct = true; llmProvider = 'openai-compatible'; speechEnabled = false; resetTurn();
+			visionEnabled = true;
+			const models: string[] = [];
+			t.mock.method(globalThis, 'fetch', async (_url: string, init: RequestInit) => {
+				models.push(JSON.parse(String(init.body)).model);
+				return new Response(sse('Hi!') + 'data: [DONE]\n\n');
+			});
+			try {
+				await sendCompanionMessage('Hello', [], hooks);
+			} finally {
+				visionEnabled = false;
+			}
+			assert.deepEqual(models, ['test-model']);
+		});
+		await t.test('route errors without a transient flag are not retried; bare gateway errors are', { timeout: 5000 }, async (t) => {
+			direct = false; llmProvider = 'openai-compatible'; speechEnabled = false; resetTurn();
+			let calls = 0;
+			t.mock.method(globalThis, 'fetch', async () => {
+				calls++;
+				return new Response('{"error":"Model is required"}', { status: 500, headers: { 'Content-Type': 'application/json' } });
+			});
+			await sendCompanionMessage('Hello', [], hooks);
+			assert.equal(calls, 1, 'our own route errors are final');
+			assert.equal(chatStore.error, 'Model is required');
+
+			resetTurn(); calls = 0;
+			t.mock.method(globalThis, 'fetch', async () => {
+				if (calls++ === 0) return new Response('<html>502 Bad Gateway</html>', { status: 502, headers: { 'Retry-After': '0' } });
+				return new Response('0:"Back."\n', { headers: { 'Content-Type': 'text/event-stream' } });
+			});
+			await sendCompanionMessage('Hello', [], hooks);
+			assert.equal(calls, 2, 'a gateway page is retried');
+			assert.equal(chatStore.error, null);
+		});
+		await t.test('a reply that drops mid-stream is not retried and stays on screen', { timeout: 5000 }, async (t) => {
+			direct = false; llmProvider = 'openai-compatible'; speechEnabled = false; resetTurn();
+			t.mock.method(console, 'error', () => {});
+			let upstream = 0;
+			t.mock.method(globalThis, 'fetch', async (url: string, init: RequestInit) => {
+				if (url === '/api/chat') return POST({ request: new Request('http://localhost/api/chat', init) });
+				upstream++;
+				return new Response(new ReadableStream({ start(controller) {
+					controller.enqueue(new TextEncoder().encode(sse('Half a thou')));
+					// Drop the connection after the text has reached the client
+					setTimeout(() => controller.error(new TypeError('terminated')), 50);
+				} }), { headers: { 'Content-Type': 'text/event-stream' } });
+			});
+			await sendCompanionMessage('Hello', [], hooks);
+			assert.equal(upstream, 1);
+			assert.ok(chatStore.error);
+			assert.equal(messages[0]?.content, 'Hello', 'the answered question stays put');
+			assert.equal(fixtures.chatDraftStore.draft, '');
+		});
+		await t.test('a draft typed during the failed turn is not overwritten', { timeout: 5000 }, async (t) => {
+			direct = true; llmProvider = 'openai-compatible'; speechEnabled = false; resetTurn();
+			t.mock.method(globalThis, 'fetch', async () => new Response('{}', { status: 400 }));
+			fixtures.chatDraftStore.draft = 'my next thought';
+			await sendCompanionMessage('Hello', [], hooks);
+			assert.equal(fixtures.chatDraftStore.draft, 'my next thought');
+			assert.equal(messages[0]?.content, 'Hello');
+		});
+	} finally {
+		buffer?.reset();
+		await server.close();
+		delete globals.__utsuwaChatIntegration;
+	}
+});

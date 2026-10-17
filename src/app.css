@@ -1,0 +1,132 @@
+@import 'tailwindcss';
+@import './lib/styles/app-theme.css';
+@import './lib/styles/app-controls.css';
+
+/* Tokens shared by the site and the app. Palettes live in site.css and app-theme.css. */
+:root {
+	--font-sans: 'Inter Variable', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+	--font-mono: ui-monospace, 'SF Mono', 'SFMono-Regular', Menlo, Consolas, monospace;
+	--ease-brand: cubic-bezier(0.16, 1, 0.3, 1);
+
+	--color-success: #22c55e;
+	--color-error: #ef4444;
+	--color-warning: #ffae00;
+	--color-info: #00b2ff;
+
+	--stat-trust: #22c55e;
+	--stat-intimacy: #ff477f;
+	--stat-comfort: #8b5cf6;
+	--stat-energy: #00b2ff;
+	--stat-respect: #f97316;
+	--stat-affection: #ff477f;
+
+	--tier-stranger: #9ca3af;
+	--tier-acquaintance: #00b2ff;
+	--tier-friend: #22c55e;
+	--tier-close-friend: #14b8a6;
+	--tier-best-friend: #ffae00;
+	--tier-soulmate: #ff477f;
+	--tier-eternal-bond: #8b5cf6;
+
+	--mood-happy: var(--color-warning);
+	--mood-sad: var(--color-info);
+	--mood-excited: #f97316;
+	--mood-anxious: #8b5cf6;
+	--mood-content: var(--color-success);
+	--mood-frustrated: var(--color-error);
+	--mood-curious: #06b6d4;
+	--mood-affectionate: var(--accent);
+	--mood-playful: #14b8a6;
+	--mood-melancholy: var(--text-tertiary);
+	--mood-neutral: var(--text-secondary);
+}
+
+.dark {
+	--color-success: #4ade80;
+	--color-error: #f87171;
+	--color-warning: #ffbf33;
+	--color-info: #33c1ff;
+
+	--stat-trust: #4ade80;
+	--stat-intimacy: #ff6b96;
+	--stat-comfort: #a78bfa;
+	--stat-energy: #33c1ff;
+	--stat-respect: #fb923c;
+	--stat-affection: #ff6b96;
+
+	--tier-stranger: #6b7280;
+	--tier-acquaintance: #33c1ff;
+	--tier-friend: #4ade80;
+	--tier-close-friend: #2dd4bf;
+	--tier-best-friend: #ffcb33;
+	--tier-soulmate: #ff6b96;
+	--tier-eternal-bond: #a78bfa;
+
+	--mood-excited: #fb923c;
+	--mood-anxious: #a78bfa;
+	--mood-curious: #22d3ee;
+	--mood-playful: #2dd4bf;
+}
+
+* {
+	box-sizing: border-box;
+}
+
+::selection {
+	background: color-mix(in srgb, var(--accent) 25%, transparent);
+}
+
+html {
+	scroll-behavior: smooth;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	html {
+		scroll-behavior: auto;
+	}
+
+	/* Clamp all CSS motion app-wide; JS transitions check the same query */
+	*,
+	*::before,
+	*::after {
+		animation-duration: 0.01ms !important;
+		animation-iteration-count: 1 !important;
+		transition-duration: 0.01ms !important;
+	}
+}
+
+html,
+body {
+	margin: 0;
+	padding: 0;
+	height: 100%;
+	font-family: var(--font-sans);
+	background-color: var(--bg-page);
+	color: var(--text-primary);
+	transition: background-color 0.2s, color 0.2s;
+	-webkit-font-smoothing: antialiased;
+	-moz-osx-font-smoothing: grayscale;
+}
+
+h1, h2, h3, h4, h5, h6 {
+	font-family: var(--font-sans);
+	letter-spacing: -0.02em;
+}
+
+::-webkit-scrollbar {
+	width: 6px;
+	height: 6px;
+}
+
+::-webkit-scrollbar-track {
+	background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+	background: var(--scrollbar-thumb);
+	border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+	background: var(--scrollbar-thumb-hover);
+}

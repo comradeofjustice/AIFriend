@@ -1,0 +1,95 @@
+/* Onboarding layout, shared by every step. Field recipes live in app-controls.css. */
+
+.ob-step {
+	display: flex;
+	flex-direction: column;
+	gap: 1.75rem;
+	padding: 2.5rem 2rem 2rem;
+}
+
+.ob-step--center {
+	align-items: center;
+	text-align: center;
+	gap: 1.25rem;
+	padding-top: 3.5rem;
+	padding-bottom: 3rem;
+}
+
+.ob-head {
+	display: flex;
+	flex-direction: column;
+	gap: 0.4rem;
+}
+
+/* Centered header only on the "moment" screens (welcome / complete) */
+.ob-step--center .ob-head {
+	align-items: center;
+	text-align: center;
+}
+
+.ob-title {
+	margin: 0;
+	font-size: 1.75rem;
+	font-weight: 600;
+	line-height: 1.12;
+	letter-spacing: -0.03em;
+	color: var(--text-primary);
+}
+
+.ob-subtitle {
+	margin: 0;
+	max-width: 320px;
+	font-size: 0.95rem;
+	line-height: 1.6;
+	color: var(--text-secondary);
+}
+
+/* Form fields */
+.ob-field {
+	display: flex;
+	flex-direction: column;
+	gap: 0.5rem;
+}
+
+.ob-label {
+	font-size: 0.8rem;
+	font-weight: 500;
+	color: var(--text-secondary);
+}
+
+.ob-input,
+.ob-textarea {
+	width: 100%;
+}
+
+.ob-textarea {
+	resize: vertical;
+	min-height: 116px;
+}
+
+.ob-input::placeholder,
+.ob-textarea::placeholder {
+	color: var(--text-tertiary);
+}
+
+.ob-hint {
+	font-size: 0.78rem;
+	color: var(--text-tertiary);
+}
+
+/* Actions */
+.ob-actions {
+	display: flex;
+	align-items: center;
+	gap: 0.75rem;
+	margin-top: 0.25rem;
+}
+
+.ob-actions--split {
+	justify-content: space-between;
+}
+
+/* Reveal optional setup without changing the existing onboarding layout. */
+.ob-advanced summary { cursor: pointer; color: var(--text-secondary); font-size: 0.8rem; }
+.ob-advanced[open] summary { margin-bottom: 1rem; }
+.ob-title:focus { outline: none; }

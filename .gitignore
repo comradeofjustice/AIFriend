@@ -1,0 +1,60 @@
+node_modules
+
+# Output
+.output
+.vercel
+.netlify
+.wrangler
+/.svelte-kit
+/build
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.*
+!.env.example
+
+# Vite
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
+
+# Tauri
+/src-tauri/target/
+
+# Claude
+.claude/
+.refs
+# Temporary marketing-capture harness (do NOT commit)
+src/routes/(shots)/
+
+# Internal working notes, never tracked
+docs/superpowers/
+
+# Browser test artifacts
+playwright-report/
+test-results/
+.e2e-tmp/
+
+# Private runtime data and deployment material
+/.data/
+/data/
+/backups/
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.log
+*.pem
+*.key
+*.p12
+*.pfx
+env.txt
+.env.txt
+.ssh/
+id_rsa
+id_ed25519
+*.tgz
+*.tar.gz

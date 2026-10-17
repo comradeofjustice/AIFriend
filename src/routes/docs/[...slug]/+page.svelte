@@ -1,0 +1,318 @@
+<script lang="ts">
+	import Icon from '$lib/components/ui/Icon.svelte';
+	import DocsPrevNext from '$lib/components/docs/DocsPrevNext.svelte';
+	import { DOCS_URL, SITE_URL } from '$lib/config/site';
+	import { docsNav } from '$lib/config/docs-nav';
+	import { localPath } from '$lib/config/links';
+	import { addCodeCopyButtons } from '$lib/utils/add-code-copy-buttons';
+	import { browser } from '$app/environment';
+	import '$lib/styles/prose.css';
+	import type { PageData } from './$types';
+
+	let { data }: { data: PageData } = $props();
+
+	let copied = $state(false);
+	let articleEl = $state<HTMLElement | null>(null);
+	let toc = $state<Array<{ id: string; text: string; level: number }>>([]);
+	let activeId = $state('');
+
+	// Which nav section does this page live under? (for the breadcrumb)
+	const section = $derived(docsNav.find((s) => s.items.some((i) => i.slug === data.slug)));
+
+	async function copyPage() {
+		const article = document.querySelector('.docs-content') as HTMLElement | null;
+		if (!article) return;
+		await navigator.clipboard.writeText(article.innerText);
+		copied = true;
+		setTimeout(() => (copied = false), 2000);
+	}
+
+	function scrollToHeading(e: MouseEvent, id: string) {
+		e.preventDefault();
+		const el = document.getElementById(id);
+		if (!el) return;
+		el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+		history.replaceState(null, '', `#${id}`);
+		activeId = id;
+	}
+
+	// Rebuild the on-page table of contents whenever the doc changes.
+	$effect(() => {
+		void data.content;
+		if (!browser || !articleEl) return;
+
+		let headings: HTMLElement[] = [];
+
+		// Active entry is the last heading above a line near the top; at the very
+		// bottom, the last heading wins since it may never reach that line.
+		const updateActive = () => {
+			if (!headings.length) return;
+			let current = headings[0].id;
+			for (const h of headings) {
+				if (h.getBoundingClientRect().top > 120) break;
+				current = h.id;
+			}
+			const main = document.querySelector('.docs-main');
+			const atBottom = main && main.scrollHeight > main.clientHeight
+				? main.scrollTop + main.clientHeight >= main.scrollHeight - 2
+				: window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 2;
+			activeId = atBottom ? headings[headings.length - 1].id : current;
+		};
+
+		let frame = 0;
+		const onScroll = () => {
+			cancelAnimationFrame(frame);
+			frame = requestAnimationFrame(updateActive);
+		};
+
+		const raf = requestAnimationFrame(() => {
+			addCodeCopyButtons('.docs-content', { wrap: true });
+
+			headings = Array.from(articleEl!.querySelectorAll<HTMLElement>('h2[id], h3[id]'));
+			toc = headings.map((h) => ({
+				id: h.id,
+				text: h.textContent ?? '',
+				level: h.tagName === 'H3' ? 3 : 2
+			}));
+			activeId = headings[0]?.id ?? '';
+			updateActive();
+		});
+
+		// Capture catches scrolls on .docs-main as well as the window on mobile.
+		document.addEventListener('scroll', onScroll, { capture: true, passive: true });
+
+		return () => {
+			cancelAnimationFrame(raf);
+			cancelAnimationFrame(frame);
+			document.removeEventListener('scroll', onScroll, { capture: true });
+		};
+	});
+</script>
+
+<svelte:head>
+	<title>{data.metadata?.title || 'Docs'} - Utsuwa</title>
+	{#if data.metadata?.description}
+		<meta name="description" content={data.metadata.description} />
+	{/if}
+	<meta property="og:type" content="article" />
+	<meta property="og:title" content={data.metadata?.title || 'Docs'} />
+	{#if data.metadata?.description}
+		<meta property="og:description" content={data.metadata.description} />
+	{/if}
+	<meta property="og:url" content={`${DOCS_URL}/${data.slug}`} />
+	<meta property="og:image" content={`${SITE_URL}/brand-assets/og-image.jpg`} />
+	<meta name="twitter:card" content="summary" />
+	<meta name="twitter:image" content={`${SITE_URL}/brand-assets/og-image.jpg`} />
+	<meta name="twitter:title" content={data.metadata?.title || 'Docs'} />
+	{#if data.metadata?.description}
+		<meta name="twitter:description" content={data.metadata.description} />
+	{/if}
+	<link rel="canonical" href={`${DOCS_URL}/${data.slug}`} />
+	{@html `<script type="application/ld+json">${JSON.stringify({
+		'@context': 'https://schema.org',
+		'@type': 'TechArticle',
+		headline: data.metadata?.title,
+		description: data.metadata?.description,
+		url: `${DOCS_URL}/${data.slug}`,
+		publisher: {
+			'@type': 'Organization',
+			name: 'Utsuwa',
+			url: SITE_URL
+		}
+	})}</script>`}
+	{@html '<style>html { scroll-padding-top: 6rem; }</style>'}
+</svelte:head>
+
+<div class="doc-wrap">
+	<div class="doc-main">
+		<div class="doc-head">
+			<nav class="breadcrumb" aria-label="Breadcrumb">
+				<a href={localPath('docs')}>Docs</a>
+				{#if section}
+					<Icon name="chevron-right" size={12} />
+					<span class="crumb-section">{section.title}</span>
+				{/if}
+				<Icon name="chevron-right" size={12} />
+				<span class="crumb-current">{data.metadata?.title || 'Page'}</span>
+			</nav>
+			<button type="button" class="btn btn-secondary btn-sm" onclick={copyPage} title="Copy page content">
+				<Icon name={copied ? 'check' : 'copy'} size={14} />
+				<span>{copied ? 'Copied' : 'Copy page'}</span>
+			</button>
+		</div>
+
+		<article class="docs-content prose" bind:this={articleEl}>
+			<data.content />
+		</article>
+		<DocsPrevNext slug={data.slug} />
+	</div>
+
+	{#if toc.length}
+		<aside class="toc" aria-label="Table of contents">
+			<p class="toc-title">Table of contents</p>
+			<ul class="toc-list">
+				{#each toc as heading}
+					<li class:sub={heading.level === 3}>
+						<a
+							href={`#${heading.id}`}
+							class:active={activeId === heading.id}
+							onclick={(e) => scrollToHeading(e, heading.id)}
+						>
+							{heading.text}
+						</a>
+					</li>
+				{/each}
+			</ul>
+		</aside>
+	{/if}
+</div>
+
+<style>
+	.doc-wrap {
+		display: flex;
+		gap: 40px;
+		max-width: 70rem;
+		margin: 0 auto;
+		padding: 24px 40px 40px;
+		align-items: flex-start;
+	}
+
+	.doc-main {
+		flex: 1;
+		min-width: 0;
+		max-width: 48rem;
+	}
+
+	.docs-content {
+		max-width: none;
+		margin: 0;
+		padding: 0;
+	}
+
+	.docs-content :global(h2),
+	.docs-content :global(h3) {
+		scroll-margin-top: 20px;
+	}
+
+	.doc-head {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 12px;
+		margin-bottom: 20px;
+	}
+
+	.doc-head .btn {
+		flex-shrink: 0;
+	}
+
+	.breadcrumb {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 6px;
+		min-width: 0;
+		color: var(--text-secondary);
+		font-size: 13px;
+		line-height: 20px;
+	}
+
+	.breadcrumb a {
+		color: inherit;
+		text-decoration: none;
+		border-radius: var(--radius-xs);
+	}
+
+	.breadcrumb a:hover {
+		color: var(--text-primary);
+	}
+
+	.crumb-current {
+		color: var(--text-primary);
+		font-weight: 500;
+	}
+
+	/* One line next to the copy button on phones; the h1 below carries the full title. */
+	@media (max-width: 768px) {
+		.breadcrumb {
+			flex-wrap: nowrap;
+			white-space: nowrap;
+		}
+
+		.crumb-current {
+			min-width: 0;
+			overflow: hidden;
+			text-overflow: ellipsis;
+		}
+	}
+
+	.toc {
+		position: sticky;
+		top: 24px;
+		width: 14rem;
+		flex-shrink: 0;
+		align-self: start;
+		max-height: calc(100vh - 104px);
+		overflow-y: auto;
+	}
+
+	.toc-title {
+		margin: 0 0 4px;
+		padding: 4px 10px;
+		color: var(--text-secondary);
+		font-size: 13px;
+		font-weight: 500;
+		line-height: 20px;
+	}
+
+	.toc-list {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+	}
+
+	.toc-list a {
+		display: block;
+		padding: 6px 10px;
+		border-radius: var(--control-radius);
+		color: var(--text-secondary);
+		font-size: 14px;
+		line-height: 20px;
+		text-decoration: none;
+		transition: color 150ms, background 150ms;
+	}
+
+	.toc-list li.sub a {
+		padding-left: 22px;
+	}
+
+	.toc-list a:hover {
+		color: var(--text-primary);
+		background: var(--control-hover);
+	}
+
+	.toc-list a.active {
+		color: var(--text-primary);
+		background: var(--control-selected);
+		font-weight: 500;
+	}
+
+	@media (max-width: 1100px) {
+		.toc {
+			display: none;
+		}
+
+		.doc-wrap {
+			max-width: 52rem;
+		}
+	}
+
+	@media (max-width: 768px) {
+		.doc-wrap {
+			padding: 16px 16px 32px;
+		}
+	}
+</style>

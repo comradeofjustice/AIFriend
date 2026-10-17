@@ -1,0 +1,103 @@
+---
+title: Local TTS Setup
+description: Give your companion a voice that runs entirely on your machine using Kokoro-FastAPI or openedai-speech.
+---
+
+# Local TTS Setup
+
+If you already run local LLMs with Ollama or LM Studio, you can give your companion a local voice too. The audio is generated on your machine, so nothing leaves the device and there are no API keys or per-character costs.
+
+Utsuwa talks to any TTS server that exposes the OpenAI `/v1/audio/speech` endpoint. The two we recommend are **Kokoro-FastAPI** and **openedai-speech**. Lip-sync works automatically because Utsuwa animates the mouth from the audio itself, no extra data needed.
+
+For a fully local, multi-language voice that needs no external API, see the [OmniVoice Setup](/docs/guides/omnivoice) guide. The rest of this page covers generic OpenAI-compatible local TTS servers.
+
+## Kokoro-FastAPI (recommended)
+
+[Kokoro-FastAPI](https://github.com/remsky/Kokoro-FastAPI) wraps the Kokoro voice model and serves the OpenAI speech API directly. It is fast on CPU and sounds great for its size.
+
+### Installation
+
+The quickest path is Docker:
+
+```bash
+docker run -p 8880:8880 ghcr.io/remsky/kokoro-fastapi-cpu:latest
+```
+
+If you have an NVIDIA GPU, use the `kokoro-fastapi-gpu` image instead. See the project README for non-Docker installs.
+
+This serves the API at `http://localhost:8880/v1`.
+
+### Connecting to Utsuwa
+
+1. Open the **Controls** panel (sliders icon, top right) and click **Settings** (gear)
+2. Open the **TTS** page
+3. Enable the **Speech (TTS)** toggle, then select **Local TTS** from the provider dropdown
+4. Leave the base URL as `http://localhost:8880/v1/` unless you changed the port
+5. Pick a **voice** (start typing in the voice field to see suggestions like `af_bella`)
+6. Leave **Model** blank to use the default, or set it to `kokoro`
+7. Send a message and your companion speaks
+
+### Voices
+
+Kokoro voice names encode region and gender, for example `af_bella` (American female) or `bm_george` (British male). Utsuwa seeds a few common ones in the voice field, and you can type any voice your server supports.
+
+## openedai-speech
+
+[openedai-speech](https://github.com/matatonic/openedai-speech) is another OpenAI-compatible server that can run Piper and other engines. Set up its server, then point Utsuwa's Local TTS base URL at it (default `http://localhost:8000/v1/`). Use the voice names that server exposes.
+
+## Custom Base URL
+
+Running the server on a different machine or port? Enter the full URL in the Local TTS base URL field. Utsuwa normalizes it to end in `/v1/`, so `http://localhost:8880`, `http://localhost:8880/v1`, and `http://localhost:8880/v1/` all work. Examples:
+
+- Custom port: `http://localhost:9000/v1/`
+- Remote machine: `http://192.168.1.50:8880/v1/` (desktop app or a self-hosted server proxy, see below)
+
+## Desktop app vs hosted website
+
+Local TTS works best in the **desktop app**, where it needs no extra setup. The desktop app talks to your local server directly, with no browser origin, mixed-content, or local-network restrictions. If you want the smoothest experience, use the desktop app.
+
+On the **hosted website** (`https://app.utsuwa.ai`) it can still work, but because a public HTTPS page is reaching a server on your own machine, the browser adds a few rules:
+
+- **Same machine only.** The server has to be on `localhost` or `127.0.0.1`. The browser blocks a TTS server on another machine over plain `http://` as mixed content. `localhost` is exempt from that block, which is why the local case works at all. The remote-machine base URL above works in the desktop app, not on the hosted site.
+- **The server must allow the site's origin.** Your TTS server needs to send CORS headers permitting `https://app.utsuwa.ai`. Kokoro-FastAPI and openedai-speech allow all origins by default, so this usually just works. A hardened or proxied server may need the origin added. For the desktop app, that origin is `tauri://localhost` on macOS and `http://tauri.localhost` on Windows and Linux.
+- **Your browser may ask permission.** Recent versions of Chrome treat a public site reaching `localhost` as a local-network request and may prompt you to allow it (or require the server to opt in). Allow it if asked.
+
+Local LLMs (Ollama, LM Studio) follow the same rules on the hosted site.
+
+### Self-hosted Utsuwa: the server proxy
+
+If you run your own Utsuwa web server, you can skip the CORS and mixed-content rules. Set `ALLOW_LOCAL_PROVIDER_HOSTS=true` in the Utsuwa server's environment and restart it. When the browser's direct request fails, the app retries once through the server's `/api/tts/local` route. The TTS server then only has to be reachable from the Utsuwa server, so it can also live on another machine on your network.
+
+The proxy only forwards speech requests to `{base URL}/audio/speech`, caps the text at 4,000 characters, and gives up after 60 seconds. Without the variable, the route refuses and you see the usual connection hint. This fallback cannot help on the hosted site at `app.utsuwa.ai`: its server cannot reach your machine.
+
+### Desktop app
+
+With the default servers, none of the browser rules apply to the desktop app. The only case that needs attention is a server you've hardened to restrict origins, which would need the desktop origin above allowed.
+
+## Troubleshooting
+
+### No sound and no error
+
+Make sure the **Speech (TTS)** switch in Settings > TTS is on and a voice is set. If the voice field is empty, type a valid voice for your server (e.g. `af_bella` for Kokoro).
+
+### "Could not reach a local TTS server"
+
+The server isn't running or isn't reachable at the base URL. Confirm it's up:
+
+```bash
+curl http://localhost:8880/v1/audio/voices
+```
+
+If that returns data but Utsuwa still can't reach it from a browser, it's almost certainly an origin or local-network block. On the hosted site the server has to allow the `https://app.utsuwa.ai` origin (Kokoro-FastAPI allows all origins by default; a proxied or hardened server may need it added), and your browser may prompt to allow access to local-network devices. See [Desktop app vs hosted website](#desktop-app-vs-hosted-website) for the full list. If you self-host Utsuwa, the [server proxy](#self-hosted-utsuwa-the-server-proxy) avoids these blocks. None of this applies to the **desktop app**, which is the smoothest way to run local TTS.
+
+### "The Utsuwa server could not reach the local TTS server at ..."
+
+The server proxy is on, but the Utsuwa server itself can't connect to the TTS server, or it took longer than 60 seconds. Check the base URL from the server's point of view: `localhost` there means the Utsuwa server's own machine or container, not yours.
+
+### "Local TTS server returned 400/404"
+
+The model or voice isn't valid for that server. Leave the model blank (Utsuwa sends `tts-1`, which most servers accept), and double-check the voice name against your server's voice list.
+
+### Choppy or delayed speech
+
+Utsuwa sends one sentence at a time and synthesizes the next sentence while the current one plays. The pause before she starts is the time your server needs for the first sentence. On slower hardware, try a GPU image, and keep responses shorter.
